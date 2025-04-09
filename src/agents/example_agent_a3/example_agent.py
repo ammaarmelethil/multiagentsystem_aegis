@@ -1,3 +1,8 @@
+# CPSC 383 W25 T05 Assignment 3 | Submission: 2025-04-08
+# Ammaar Melethil | 30141956 
+# Muhammad Hasham | 30171303 
+# Other 2 ppl in our group withdrew from the class :( -- apologies for the bloated code
+
 from typing import override, Dict, List, Set, Tuple, Optional
 from collections import deque, defaultdict
 import heapq
@@ -32,7 +37,6 @@ MSG_RUBBLE = "RUBBLE"             # Share rubble locations
 MSG_DANGEROUS = "DANGEROUS"       # Share dangerous cells
 MSG_POSITION = "POSITION"         # Share agent positions
 MSG_SECTOR = "SECTOR"             # Share which sector an agent is exploring
-MSG_RUBBLE_LEADER = "LEAD"        # Claim leadership of a rubble site
 MSG_RUBBLE_HELPER = "HELP"        # Commit to helping at a rubble site
 MSG_SAVED = "SAVED"               # Indicate a survivor was saved
 
@@ -48,38 +52,43 @@ class ExampleAgent(Brain):
         self._potential_survivor_rubble = set() # Rubble cells with life signals
         self._visited = set()                 # (x,y) visited locations
         self._dangerous_cells = set()         # (x,y) dangerous locations
+        self._skipped_rubble = set()          # (x,y) rubble we've decided to skip
         
-        # Add this line here
-        self._last_high_cost_cell = False     # Track if we just moved through high-cost terrain
+        # Adaptive cost learning
+        self._previous_energy = None          # Energy level from previous turn
+        self._previous_location = None        # Location from previous turn
+        self._move_costs = {}                 # Dictionary to store learned move costs
+        self._high_cost_threshold = 10        # Threshold for high movement cost
         
         # Energy management
-        self._max_energy = 500               # Default max energy
-        self._low_energy = 150               # When to seek charging (30%)
-        self._critical_energy = 80           # Emergency threshold (16%)
+        self._max_energy = None               # Default max energy
+        self._low_energy = None               # When to seek charging (30%)
+        self._critical_energy = None          # Emergency threshold (16%)
         
         # Path finding
-        self._current_path = []              # Path currently following
-        self._blacklist = set()              # Temporarily blocked cells
+        self._current_path = []               # Path currently following
+        self._blacklist = set()               # Temporarily blocked cells
         
         # Agent coordination
-        self._agent_positions = {}           # agent_id -> (x,y)
-        self._last_position = None           # Last position (for stagnation)
-        self._stagnation_counter = 0         # Turns in same position
+        self._agent_positions = {}            # agent_id -> (x,y)
+        self._last_position = None            # Last position (for stagnation)
+        self._stagnation_counter = 0          # Turns in same position
         
         # Sector exploration
-        self._world_width = 15               # Default world size
-        self._world_height = 15              # Default world size
-        self._sector_size = 4                # Size of exploration sectors
-        self._sectors = []                   # List of sector data
-        self._my_sector = None               # Currently assigned sector
-        self._sectors_explored = set()       # Fully explored sectors
+        self._world_width = None              # Default world size
+        self._world_height = None              # Default world size
+        self._sector_size = None              # Size of exploration sectors
+        self._sectors = []                    # List of sector data
+        self._my_sector = None                # Currently assigned sector
+        self._sectors_explored = set()        # Fully explored sectors
         
         # Rubble coordination
-        self._rubble_leaders = {}            # (x,y) -> agent_id
         self._rubble_helpers = defaultdict(set) # (x,y) -> set of agent_ids
-        self._my_rubble_role = None          # "leader" or "helper" 
-        self._my_rubble_pos = None           # (x,y) of rubble I'm committed to
-        self._rubble_wait_turns = 0          # Turns waited at rubble
+        
+        # Corner handling
+        self._corner_positions = set()        # Track corner positions
+        self._corner_commitment = 0           # Track commitment to corners
+        self._max_corner_commitment = 10      # Wait longer at corner rubble
     
     @override
     def handle_send_message_result(self, smr: SEND_MESSAGE_RESULT) -> None:
@@ -113,6 +122,9 @@ class ExampleAgent(Brain):
             # Check if this rubble has potential survivors
             if len(parts) > 5 and int(parts[5]) == 1:
                 self._potential_survivor_rubble.add((x, y))
+                # Remove from skipped rubble if it has survivors
+                if (x, y) in self._skipped_rubble:
+                    self._skipped_rubble.remove((x, y))
             
         elif msg_type == MSG_DANGEROUS:
             # Add dangerous cell
@@ -133,12 +145,6 @@ class ExampleAgent(Brain):
                     if sender_id < self._agent.get_agent_id().id:
                         self._my_sector = None  # I give up this sector
                 
-        elif msg_type == MSG_RUBBLE_LEADER:
-            # Another agent is claiming leadership of a rubble cell
-            x, y = int(parts[1]), int(parts[2])
-            agents_needed = int(parts[3])
-            self._rubble_leaders[(x, y)] = sender_id
-            
         elif msg_type == MSG_RUBBLE_HELPER:
             # Another agent is helping at a rubble cell
             x, y = int(parts[1]), int(parts[2])
@@ -150,6 +156,80 @@ class ExampleAgent(Brain):
             pos = (x, y)
             if pos in self._known_survivors:
                 self._known_survivors.remove(pos)
+
+    @override
+    def handle_observe_result(self, ovr: OBSERVE_RESULT) -> None:
+        """Process observation results"""
+        loc = ovr.cell_info.location
+        pos = (loc.x, loc.y)
+        
+        # Mark position as visited
+        self._visited.add(pos)
+        
+        # Process dangerous cells
+        self._process_dangerous_cells(ovr.surround_info)
+        
+        # Check for charging cells
+        if ovr.cell_info.is_charging_cell():
+            self._known_charging.add(pos)
+            self._broadcast(f"{MSG_CHARGING}:{pos[0]}:{pos[1]}")
+        
+        # Process top layer
+        top_layer = ovr.cell_info.get_top_layer()
+        
+        # Check for survivors
+        if isinstance(top_layer, Survivor):
+            self._known_survivors.add(pos)
+            self._broadcast(f"{MSG_SURVIVOR}:{pos[0]}:{pos[1]}")
+        
+        # Check for rubble and survivors underneath
+        if isinstance(top_layer, Rubble):
+            energy = top_layer.remove_energy
+            agents = top_layer.remove_agents
+            self._known_rubble[pos] = (energy, agents)
+            
+            # Check for survivors under rubble
+            has_survivor = self._detect_survivor_under_rubble(ovr, pos)
+            
+            if has_survivor:
+                self._potential_survivor_rubble.add(pos)
+                # Remove from skipped list if it was previously added
+                if pos in self._skipped_rubble:
+                    self._skipped_rubble.remove(pos)
+                # Broadcast to all agents that this rubble has potential survivors
+                self._broadcast(f"{MSG_RUBBLE}:{pos[0]}:{pos[1]}:{energy}:{agents}:1")
+
+        # Check if we're at a position that previously had rubble but now doesn't
+        if pos in self._known_rubble and not isinstance(top_layer, Rubble):
+            self._clear_rubble_data(pos)
+
+    def _detect_survivor_under_rubble(self, ovr, pos):
+        """Unified method to detect survivors under rubble using multiple methods"""
+        # Method 1: Check using life signals
+        if ovr.life_signals and ovr.life_signals.size() > 1:
+            for i in range(1, ovr.life_signals.size()):
+                signal = ovr.life_signals.get(i)
+                if signal > 0:
+                    self._agent.log(f"CRITICAL: Survivor under rubble at {pos} - via life signal")
+                    return True
+        
+        # Method 2: Use direct cell inspection
+        world = self.get_world()
+        if world:
+            cell = world.get_cell_at(ovr.cell_info.location)
+            if cell and cell.number_of_survivors() > 0:
+                self._agent.log(f"CRITICAL: Survivor detected under rubble at {pos} - via direct check")
+                return True
+        
+        return False
+
+    def _clear_rubble_data(self, pos):
+        """Clear all data related to a rubble position that's now gone"""
+        self._agent.log(f"Detected cleared rubble at {pos}")
+        self._known_rubble.pop(pos, None)
+        self._potential_survivor_rubble.discard(pos)
+        self._skipped_rubble.discard(pos)
+        self._rubble_helpers.pop(pos, None)
 
     def _process_dangerous_cells(self, surround_info):
         """Process and share dangerous cells"""
@@ -166,76 +246,6 @@ class ExampleAgent(Brain):
                 if cell_info.is_fire_cell() or cell_info.is_killer_cell():
                     self._dangerous_cells.add(pos)
                     self._broadcast(f"{MSG_DANGEROUS}:{pos[0]}:{pos[1]}")
-
-    @override
-    def handle_observe_result(self, ovr: OBSERVE_RESULT) -> None:
-        """Process observation results"""
-        loc = ovr.cell_info.location
-        pos = (loc.x, loc.y)
-        
-        # Update world size estimates
-        self._world_width = max(self._world_width, loc.x + 1)
-        self._world_height = max(self._world_height, loc.y + 1)
-        
-        # Mark position as visited
-        self._visited.add(pos)
-        
-        # Check for dangerous cells in surroundings
-        self._process_dangerous_cells(ovr.surround_info)
-        
-        # Check for charging cells
-        if ovr.cell_info.is_charging_cell():
-            self._known_charging.add(pos)
-            self._broadcast(f"{MSG_CHARGING}:{pos[0]}:{pos[1]}")
-        
-        # Process top layer
-        top_layer = ovr.cell_info.get_top_layer()
-        
-        # Check for survivors
-        if isinstance(top_layer, Survivor):
-            self._known_survivors.add(pos)
-            self._broadcast(f"{MSG_SURVIVOR}:{pos[0]}:{pos[1]}")
-        
-        # Check for rubble
-        if isinstance(top_layer, Rubble):
-            energy = top_layer.remove_energy
-            agents = top_layer.remove_agents
-            self._known_rubble[pos] = (energy, agents)
-            
-            # Check for life signals under rubble
-            if ovr.life_signals and ovr.life_signals.size() > 1:  # More than 1 means deeper layers exist
-                for i in range(1, ovr.life_signals.size()):  # Start from index 1 (layer under top)
-                    signal = ovr.life_signals.get(i)
-                    if signal > 0:  # Any positive signal indicates survivor
-                        self._agent.log(f"CRITICAL: Survivor under rubble at {pos} - signal:{signal}")
-                        self._potential_survivor_rubble.add(pos)
-                        # Broadcast to all agents that this rubble has potential survivors
-                        self._broadcast(f"{MSG_RUBBLE}:{pos[0]}:{pos[1]}:{energy}:{agents}:1")
-                        break
-
-        # Add this line to track that we've moved through a high cost cell
-        if ovr.cell_info.move_cost > 2:
-            self._last_high_cost_cell = True
-        else:
-            self._last_high_cost_cell = False
-
-        # CRITICAL FIX 4: Check if we're at a position that previously had rubble but now doesn't
-        if pos in self._known_rubble and not isinstance(top_layer, Rubble):
-            # The rubble is gone, clear our tracking for this position
-            self._agent.log(f"Detected cleared rubble at {pos}")
-            self._known_rubble.pop(pos)
-            if pos in self._potential_survivor_rubble:
-                self._potential_survivor_rubble.remove(pos)
-            if pos in self._rubble_leaders:
-                del self._rubble_leaders[pos]
-            if pos in self._rubble_helpers:
-                del self._rubble_helpers[pos]
-            
-            # Also reset our role if we were working on this rubble
-            if self._my_rubble_pos == pos:
-                self._my_rubble_role = None
-                self._my_rubble_pos = None
-                self._rubble_wait_turns = 0
 
     @override
     def handle_save_surv_result(self, ssr: SAVE_SURV_RESULT) -> None:
@@ -267,110 +277,6 @@ class ExampleAgent(Brain):
         else:
             self._agent.log(f"Incorrect prediction for survivor {prd.surv_id}")
 
-    def _handle_rubble_coordination(self, current_pos, current_cell, top_layer, current_energy, current_loc):
-        """Simplified rubble handling focused on survivor detection"""
-        world = self.get_world()
-        if not world:
-            return False
-            
-        # CASE 1: Standing on rubble - check for survivors and dig if needed
-        if isinstance(top_layer, Rubble):
-            energy_needed = top_layer.remove_energy
-            agents_needed = top_layer.remove_agents
-            
-            # Update tracking
-            self._known_rubble[current_pos] = (energy_needed, agents_needed)
-            
-            # Log rubble information
-            self._agent.log(f"On rubble: energy={energy_needed}, agents={agents_needed}, survivor={current_pos in self._potential_survivor_rubble}")
-            
-            # Always broadcast rubble info, with survivor status if known
-            has_survivor = 1 if current_pos in self._potential_survivor_rubble else 0
-            self._broadcast(f"{MSG_RUBBLE}:{current_pos[0]}:{current_pos[1]}:{energy_needed}:{agents_needed}:{has_survivor}")
-
-            # CASE A: Zero-agent rubble - always dig
-            if agents_needed == 0:
-                self._agent.log(f"Digging zero-agent rubble")
-                self.send_end_turn(TEAM_DIG())
-                return True
-                
-            # CASE B: Single-agent rubble - dig if enough energy
-            if agents_needed == 1:
-                # Determine appropriate energy threshold based on world conditions
-                # If no charging cells exist, use much lower threshold
-                energy_threshold = 10 if not self._known_charging else self._critical_energy
-                
-                # If rubble contains a survivor, use even lower threshold
-                if current_pos in self._potential_survivor_rubble:
-                    energy_threshold = 5  # Minimum threshold for critical rescue
-                
-                # Check energy requirements with adaptive threshold
-                if energy_needed == 0 or current_energy > energy_needed + energy_threshold:
-                    self._agent.log(f"Digging single-agent rubble with {current_energy} energy (threshold: {energy_threshold})")
-                    self.send_end_turn(TEAM_DIG())
-                    return True
-                else:
-                    # Not enough energy, check if we can get help
-                    self._broadcast(f"{MSG_RUBBLE_HELPER}:{current_pos[0]}:{current_pos[1]}")
-                    self._agent.log(f"Requesting help at {current_pos} - low energy ({current_energy})")
-                    
-                    # Stay put and wait for help
-                    self.send_end_turn(MOVE(Direction.CENTER))
-                    return True
-            
-            # CASE C: Multi-agent rubble - coordinate with other agents
-            if agents_needed > 1:
-                # Check if enough agents are present on this cell
-                agents_here = 1  # Count ourselves
-                for _, pos in self._agent_positions.items():
-                    if pos == current_pos:
-                        agents_here += 1
-                
-                # Broadcast that we're at this rubble to coordinate 
-                self._broadcast(f"{MSG_RUBBLE_HELPER}:{current_pos[0]}:{current_pos[1]}")
-                
-                # If we have enough agents, dig!
-                if agents_here >= agents_needed and (energy_needed == 0 or current_energy > energy_needed + self._critical_energy):
-                    self._agent.log(f"DIGGING multi-agent rubble with {agents_here-1} other agents")
-                    self.send_end_turn(TEAM_DIG())
-                    return True
-                
-                # Not enough agents yet, wait
-                self._agent.log(f"Waiting for more agents at rubble: have {agents_here}, need {agents_needed}")
-                self.send_end_turn(MOVE(Direction.CENTER))
-                return True
-        
-        # CASE 2: Check adjacent cells for rubble to investigate
-        adjacent_rubble = self._check_adjacent_rubble()
-        if adjacent_rubble:
-            rubble_pos, direction = adjacent_rubble
-            self._agent.log(f"Moving to check rubble at {rubble_pos}")
-            self.send_end_turn(MOVE(direction))
-            return True
-            
-        # CASE 3: Move to known survivor rubble
-        for pos in self._potential_survivor_rubble:
-            if pos in self._known_rubble:
-                path = self._find_path(current_loc, create_location(pos[0], pos[1]))
-                if path and len(path) + self._critical_energy < current_energy:
-                    direction = self._get_next_move_direction(current_loc, path)
-                    if direction:
-                        self.send_end_turn(MOVE(direction))
-                        return True
-                        
-        # CASE 4: Move to any unexplored rubble
-        for pos, (energy, agents) in self._known_rubble.items():
-            if pos not in self._visited:
-                path = self._find_path(current_loc, create_location(pos[0], pos[1]))
-                if path and len(path) + self._critical_energy < current_energy:
-                    direction = self._get_next_move_direction(current_loc, path)
-                    if direction:
-                        self.send_end_turn(MOVE(direction))
-                        return True
-        
-        # No rubble action taken
-        return False
-
     def _check_adjacent_rubble(self):
         """Find important rubble in adjacent cells"""
         current_loc = self._agent.get_location()
@@ -401,24 +307,34 @@ class ExampleAgent(Brain):
                 energy = top_layer.remove_energy
                 agents = top_layer.remove_agents
                 
-                # Skip if we don't have enough energy
-                if self._agent.get_energy_level() <= energy + self._critical_energy:
+                # Check if this is known survivor rubble - NEVER skip these
+                has_survivor = next_pos in self._potential_survivor_rubble
+                
+                # Skip if no survivor AND in our skip list
+                if not has_survivor and next_pos in self._skipped_rubble:
+                    self._agent.log(f"Skipping previously evaluated rubble at {next_pos}")
                     continue
-                    
+                
+                # Skip if not a survivor AND we shouldn't participate based on ID
+                if not has_survivor and agents > 1 and self._agent.get_agent_id().id > agents:
+                    self._agent.log(f"Skipping rubble at {next_pos} (need {agents}, ID {self._agent.get_agent_id().id})")
+                    # Remember to skip this rubble in the future
+                    self._skipped_rubble.add(next_pos)
+                    continue
+                
                 # Calculate priority score for this rubble
                 score = 0
                 
                 # Highest priority: Known survivor rubble
-                if next_pos in self._potential_survivor_rubble:
+                if has_survivor:
                     score = 100
-                
+                    self._agent.log(f"Found SURVIVOR RUBBLE at {next_pos} - agents needed: {agents}")
                 # Next priority: Unchecked rubble (might have survivors)
                 elif next_pos not in self._visited:
-                    score = 70  # Increased from 50 to prioritize unchecked rubble
+                    score = 90
                     # Add to known rubble so it can be checked
                     self._known_rubble[next_pos] = (energy, agents)
                     self._broadcast(f"{MSG_RUBBLE}:{next_pos[0]}:{next_pos[1]}:{energy}:{agents}:0")
-                
                 # Low priority: Already visited rubble
                 else:
                     score = 10
@@ -430,6 +346,200 @@ class ExampleAgent(Brain):
         
         return best_rubble
 
+    def _handle_rubble_coordination(self, current_pos, current_cell, top_layer, current_energy, current_loc):
+        """Handle rubble coordination and digging decisions"""
+        world = self.get_world()
+        if not world:
+            return False
+            
+        # CASE 1: Standing on rubble - check for survivors and dig if needed
+        if isinstance(top_layer, Rubble):
+            energy_needed = top_layer.remove_energy
+            agents_needed = top_layer.remove_agents
+            
+            # Update tracking and check for survivors
+            self._known_rubble[current_pos] = (energy_needed, agents_needed)
+            has_survivor = current_pos in self._potential_survivor_rubble
+            
+            # Log rubble information
+            self._agent.log(f"On rubble: energy={energy_needed}, agents={agents_needed}, survivor={has_survivor}")
+            self._broadcast(f"{MSG_RUBBLE}:{current_pos[0]}:{current_pos[1]}:{energy_needed}:{agents_needed}:{1 if has_survivor else 0}")
+
+            # CASE A: Zero-agent rubble - always dig
+            if agents_needed == 0:
+                self._agent.log(f"Digging zero-agent rubble")
+                self.send_end_turn(TEAM_DIG())
+                return True
+                
+            # CASE B: Single-agent rubble - dig if enough energy
+            if agents_needed == 1:
+                # Determine energy threshold based on conditions
+                energy_threshold = 5 if has_survivor else (10 if not self._known_charging else self._critical_energy)
+                
+                if energy_needed == 0 or current_energy > energy_needed + energy_threshold:
+                    self._agent.log(f"Digging single-agent rubble with {current_energy} energy")
+                    self.send_end_turn(TEAM_DIG())
+                    return True
+                else:
+                    # Not enough energy, stay put and wait for help
+                    self._broadcast(f"{MSG_RUBBLE_HELPER}:{current_pos[0]}:{current_pos[1]}")
+                    self.send_end_turn(MOVE(Direction.CENTER))
+                    return True
+            
+            # CASE C: Multi-agent rubble - coordinate with other agents
+            if agents_needed > 1:
+                # Determine if this agent should participate
+                should_participate = self._should_participate_in_rubble(current_pos, agents_needed, has_survivor)
+                
+                # Count agents present
+                agents_here = self._count_agents_at_position(current_pos)
+                
+                # Special handling for corners
+                if self._is_corner_position(current_pos) and energy_needed == 0:
+                    if self._handle_corner_rubble(current_pos, agents_needed, agents_here):
+                        return True
+                
+                if should_participate:
+                    return self._handle_participate_in_rubble(current_pos, energy_needed, agents_needed, agents_here, current_energy, has_survivor)
+                else:
+                    # Not participating - add to skip list and move away
+                    if not has_survivor:  # Only skip if not a survivor rubble
+                        self._skipped_rubble.add(current_pos)
+                    
+                    # Move to another unexplored area
+                    return self._move_to_unexplored_from_rubble(current_loc, world)
+        
+        # CASE 2-4: Check for other rubble-related actions
+        return self._handle_other_rubble_actions(current_loc, current_energy, world)
+
+    def _should_participate_in_rubble(self, pos, agents_needed, has_survivor):
+        """Determine if this agent should participate in clearing rubble"""
+        # Always participate if rubble has survivors
+        if has_survivor:
+            return True
+        
+        # Participate based on agent ID (lowest IDs help)
+        return self._agent.get_agent_id().id <= agents_needed
+
+    def _count_agents_at_position(self, pos):
+        """Count how many agents are at a specific position"""
+        count = 1  # Start with self
+        for agent_pos in self._agent_positions.values():
+            if agent_pos == pos:
+                count += 1
+        return count
+
+    def _is_corner_position(self, pos):
+        """Check if a position is at a world corner"""
+        if self._world_width is None or self._world_height is None:
+            return False
+            
+        return ((pos[0] == 0 and pos[1] == 0) or
+                (pos[0] == 0 and pos[1] == self._world_height - 1) or
+                (pos[0] == self._world_width - 1 and pos[1] == 0) or
+                (pos[0] == self._world_width - 1 and pos[1] == self._world_height - 1))
+
+    def _handle_corner_rubble(self, pos, agents_needed, agents_here):
+        """Special handling for corner rubble"""
+        self._corner_positions.add(pos)
+        self._corner_commitment += 1
+        
+        # Broadcast stronger signal for corners
+        self._broadcast(f"{MSG_RUBBLE_HELPER}:{pos[0]}:{pos[1]}:CORNER")
+        
+        # Dig if enough agents
+        if agents_here >= agents_needed:
+            self._agent.log(f"CORNER DIG with {agents_here} agents at {pos}")
+            self._corner_commitment = 0  # Reset commitment
+            self.send_end_turn(TEAM_DIG())
+            return True
+        
+        # Stay committed to corners longer
+        if self._corner_commitment < self._max_corner_commitment:
+            self._agent.log(f"CORNER WAIT: {self._corner_commitment}/{self._max_corner_commitment}")
+            self.send_end_turn(MOVE(Direction.CENTER))
+            return True
+        
+        # Reset commitment if giving up
+        self._corner_commitment = 0
+        return False
+
+    def _handle_participate_in_rubble(self, pos, energy_needed, agents_needed, agents_here, current_energy, has_survivor):
+        """Handle participation in rubble clearing"""
+        # Broadcast that we're helping
+        self._broadcast(f"{MSG_RUBBLE_HELPER}:{pos[0]}:{pos[1]}")
+        
+        # Set energy threshold based on survivor presence
+        energy_threshold = 5 if has_survivor else self._critical_energy
+        
+        # Try to dig if enough agents
+        if agents_here >= agents_needed:
+            if current_energy > energy_needed + 10:  # Normal dig
+                self._agent.log(f"DIGGING multi-agent rubble as agent {self._agent.get_agent_id().id}")
+                self.send_end_turn(TEAM_DIG())
+                return True
+            elif current_energy <= 5:  # Emergency dig
+                self._agent.log(f"EMERGENCY DIG with {current_energy} energy")
+                self.send_end_turn(TEAM_DIG())
+                return True
+        
+        # Not enough agents yet, wait for help
+        self._agent.log(f"Waiting for help at {pos}: have {agents_here}, need {agents_needed}")
+        self.send_end_turn(MOVE(Direction.CENTER))
+        return True
+
+    def _move_to_unexplored_from_rubble(self, current_loc, world):
+        """Move away from rubble to unexplored area"""
+        for direction in sorted(list(Direction), key=lambda _: random.random()):
+            if direction == Direction.CENTER:
+                continue
+                
+            next_loc = current_loc.add(direction)
+            next_pos = (next_loc.x, next_loc.y)
+            
+            if (world.on_map(next_loc) and 
+                next_pos not in self._dangerous_cells and
+                next_pos not in self._visited):
+                self.send_end_turn(MOVE(direction))
+                return True
+        
+        return False
+
+    def _handle_other_rubble_actions(self, current_loc, current_energy, world):
+        """Handle other rubble-related actions (cases 2-4)"""
+        # CASE 2: Check adjacent cells for rubble to investigate
+        adjacent_rubble = self._check_adjacent_rubble()
+        if adjacent_rubble:
+            rubble_pos, direction = adjacent_rubble
+            self._agent.log(f"Moving to check rubble at {rubble_pos}")
+            self.send_end_turn(MOVE(direction))
+            return True
+            
+        # CASE 3: Move to known survivor rubble
+        for pos in self._potential_survivor_rubble:
+            if pos in self._known_rubble:
+                path = self._find_path(current_loc, create_location(pos[0], pos[1]))
+                path_cost = self._calculate_path_energy_cost(path, world)
+                if path and path_cost + self._critical_energy < current_energy:
+                    direction = self._get_next_move_direction(current_loc, path)
+                    if direction:
+                        self.send_end_turn(MOVE(direction))
+                        return True
+                        
+        # CASE 4: Move to any unexplored rubble
+        for pos, (energy, agents) in self._known_rubble.items():
+            if pos not in self._visited and pos not in self._skipped_rubble:
+                path = self._find_path(current_loc, create_location(pos[0], pos[1]))
+                path_cost = self._calculate_path_energy_cost(path, world)
+                if path and path_cost + self._critical_energy < current_energy:
+                    direction = self._get_next_move_direction(current_loc, path)
+                    if direction:
+                        self.send_end_turn(MOVE(direction))
+                        return True
+        
+        # No rubble action taken
+        return False
+
     @override
     def think(self) -> None:
         """Main decision-making method"""
@@ -437,13 +547,33 @@ class ExampleAgent(Brain):
         current_pos = (current_loc.x, current_loc.y)
         current_energy = self._agent.get_energy_level()
         
-        # Share our position
+        # Learn movement costs - add this new code block
+        if self._previous_location and self._previous_energy:
+            prev_pos = (self._previous_location.x, self._previous_location.y)
+            if prev_pos != current_pos:  # Only if we actually moved
+                # Calculate the energy cost of this move
+                cost = self._previous_energy - current_energy
+                # Store it in our cost dictionary
+                self._move_costs[(prev_pos[0], prev_pos[1], current_pos[0], current_pos[1])] = cost
+                
+                # Log unusually high costs, especially at rubble positions
+                if cost > self._high_cost_threshold:
+                    self._agent.log(f"HIGH COST MOVE: {prev_pos} -> {current_pos} = {cost}")
+                    # Force path recalculation if cost is very high
+                    if cost > 20:
+                        self._current_path = []
+                        
+        
+        # Store current values for next turn
+        self._previous_energy = current_energy
+        self._previous_location = current_loc
+        
+        # Initialize energy thresholds and world data
+        self._initialize_settings(current_energy)
+        
+        # Share position and manage exploration
         self._broadcast(f"{MSG_POSITION}:{current_loc.x}:{current_loc.y}")
-        
-        # Mark position as visited
         self._visited.add(current_pos)
-        
-        # Check for stagnation
         self._check_stagnation(current_pos)
         
         # Get world information
@@ -452,15 +582,11 @@ class ExampleAgent(Brain):
             self.send_end_turn(MOVE(Direction.CENTER))
             return
         
-        # Manage sector assignments
         self._manage_sectors()
         
         # Handle predictions if needed
-        if self._agent.get_prediction_info_size() > 0:
-            surv_id, image, labels = self._agent.get_prediction_info()
-            if surv_id >= 0 and labels is not None and len(labels) > 0:
-                self.send_end_turn(PREDICT(surv_id, labels[0]))
-                return
+        if self._handle_predictions():
+            return
         
         # Get current cell information
         current_cell = world.get_cell_at(current_loc)
@@ -468,8 +594,9 @@ class ExampleAgent(Brain):
             self.send_end_turn(MOVE(Direction.CENTER))
             return
         
-        # PRIORITY 1: Save survivor if on one
         top_layer = current_cell.get_top_layer()
+        
+        # PRIORITY 1: Save survivor if on one
         if isinstance(top_layer, Survivor):
             self.send_end_turn(SAVE_SURV())
             return
@@ -479,17 +606,69 @@ class ExampleAgent(Brain):
         if survivor_direction:
             self.send_end_turn(MOVE(survivor_direction))
             return
+        
+        # PRIORITY 2.5: Check adjacent rubble cells
+        adjacent_rubble = self._check_adjacent_rubble()
+        if adjacent_rubble:
+            rubble_pos, direction = adjacent_rubble
+            self._agent.log(f"Moving to check rubble at {rubble_pos} for life signals")
+            self.send_end_turn(MOVE(direction))
+            return
 
-        # PRIORITY 3: Handle rubble coordination (checking, digging, saving survivors)
+        # PRIORITY 3: Handle rubble coordination
         if self._handle_rubble_coordination(current_pos, current_cell, top_layer, current_energy, current_loc):
             return
         
+        # PRIORITY 4-11: Handle other priorities
+        self._handle_other_priorities(current_loc, current_pos, current_energy, current_cell, world)
+
+    def _initialize_settings(self, current_energy):
+        """Initialize energy thresholds and world settings"""
+        # Set energy thresholds if not already set
+        if self._max_energy is None:
+            self._max_energy = current_energy
+            self._low_energy = max(self._max_energy * 0.3, 15)  # 30% or minimum 15
+            self._critical_energy = max(self._max_energy * 0.16, 8)  # 16% or minimum 8
+        
+        # Get world dimensions on first access
+        world = self.get_world()
+        if world and self._world_width is None:
+            self._world_width = world.width
+            self._world_height = world.height
+            
+            # Calculate sector size based on world size
+            dimension = min(self._world_width, self._world_height)
+            if dimension <= 10:
+                self._sector_size = 3
+            elif dimension <= 20:
+                self._sector_size = 4
+            else:
+                self._sector_size = 5
+            
+            # Adjust corner commitment based on world size
+            self._max_corner_commitment = max(5, min(15, round(dimension * 0.6)))
+            
+            self._agent.log(f"World size detected: {self._world_width}x{self._world_height}, "
+                           f"using sector size: {self._sector_size}")
+
+    def _handle_predictions(self):
+        """Handle any pending predictions"""
+        if self._agent.get_prediction_info_size() > 0:
+            surv_id, image, labels = self._agent.get_prediction_info()
+            if surv_id >= 0 and labels is not None and len(labels) > 0:
+                self.send_end_turn(PREDICT(surv_id, labels[0]))
+                return True
+        return False
+
+    def _handle_other_priorities(self, current_loc, current_pos, current_energy, current_cell, world):
+        """Handle priorities 4-11 in think() method"""
         # PRIORITY 4: Emergency charging when critically low on energy
         if current_energy < self._critical_energy and self._known_charging:
             nearest_charging = self._find_nearest(current_loc, self._known_charging)
             if nearest_charging:
                 path = self._find_path(current_loc, nearest_charging)
-                if path and len(path) < current_energy - 20:
+                path_cost = self._calculate_path_energy_cost(path, world)
+                if path and path_cost + self._critical_energy < current_energy:
                     direction = self._get_next_move_direction(current_loc, path)
                     if direction:
                         self.send_end_turn(MOVE(direction))
@@ -519,56 +698,48 @@ class ExampleAgent(Brain):
             nearest_survivor = self._find_nearest(current_loc, self._known_survivors)
             if nearest_survivor:
                 path = self._find_path(current_loc, nearest_survivor)
-                if path and len(path) + self._critical_energy < current_energy:
+                path_cost = self._calculate_path_energy_cost(path, world)
+                if path and path_cost + self._critical_energy < current_energy:
                     direction = self._get_next_move_direction(current_loc, path)
                     if direction:
                         self.send_end_turn(MOVE(direction))
                         return
         
-        # PRIORITY 7: Move to potential survivor rubble
-        if self._potential_survivor_rubble:
-            for pos in self._potential_survivor_rubble:
-                # Check if rubble still needs help
-                if pos in self._known_rubble:
-                    energy, agents = self._known_rubble[pos]
-                    path = self._find_path(current_loc, create_location(pos[0], pos[1]))
-                    if path and len(path) + self._critical_energy < current_energy:
-                        direction = self._get_next_move_direction(current_loc, path)
-                        if direction:
-                            self.send_end_turn(MOVE(direction))
-                            return
+        # PRIORITY 7: Move to potential survivor rubble (already handled in rubble coordination)
         
         # PRIORITY 8: Seek charging when energy low
         if current_energy < self._low_energy and self._known_charging:
             nearest_charging = self._find_nearest(current_loc, self._known_charging)
             if nearest_charging:
                 path = self._find_path(current_loc, nearest_charging)
-                if path and len(path) + self._critical_energy < current_energy:
+                path_cost = self._calculate_path_energy_cost(path, world)
+                if path and path_cost + self._critical_energy < current_energy:
                     direction = self._get_next_move_direction(current_loc, path)
                     if direction:
                         self.send_end_turn(MOVE(direction))
                         return
         
-        # NEW PRIORITY 9: Actively move to assigned sector for exploration
+        # PRIORITY 9: Actively move to assigned sector for exploration
         if self._my_sector is not None:
             unexplored_loc = self._find_unexplored_in_sector()
             if unexplored_loc:
                 path = self._find_path(current_loc, unexplored_loc)
-                if path and len(path) + self._critical_energy < current_energy:
+                path_cost = self._calculate_path_energy_cost(path, world)
+                if path and path_cost + self._critical_energy < current_energy:
                     direction = self._get_next_move_direction(current_loc, path)
                     if direction:
                         self._agent.log(f"Moving to explore sector {self._my_sector}")
                         self.send_end_turn(MOVE(direction))
                         return
         
-        # PRIORITY 10: Continue following existing path (was PRIORITY 9 before)
+        # PRIORITY 10: Continue following existing path
         if self._current_path:
             direction = self._get_next_move_direction(current_loc, self._current_path)
             if direction:
                 self.send_end_turn(MOVE(direction))
                 return
         
-        # PRIORITY 11: General exploration (was PRIORITY 10 before)
+        # PRIORITY 11: General exploration
         for direction in sorted(list(Direction), key=lambda _: random.random()):
             if direction == Direction.CENTER:
                 continue
@@ -622,9 +793,9 @@ class ExampleAgent(Brain):
                 self._blacklist.add(current_pos)
                 self._current_path = []
                 
-                # Reset rubble commitment if stuck
-                self._my_rubble_role = None
-                self._my_rubble_pos = None
+                # Reset skipped rubble for this position to reassess
+                if current_pos in self._skipped_rubble:
+                    self._skipped_rubble.remove(current_pos)
                 
                 self._stagnation_counter = 0
         else:
@@ -666,7 +837,7 @@ class ExampleAgent(Brain):
         return nearest
 
     def _find_path(self, start, goal):
-        """A* pathfinding with safety checks"""
+        """A* pathfinding with adaptive move cost learning"""
         world = self.get_world()
         if not world:
             return []
@@ -701,18 +872,27 @@ class ExampleAgent(Brain):
                     self._dangerous_cells.add(next_pos)
                     continue
                 
-                # Calculate move cost
-                move_cost = 1
-                top_layer = cell.get_top_layer()
-                if isinstance(top_layer, Rubble) and (next_loc.x != goal.x or next_loc.y != goal.y):
-                    # Higher cost for rubble unless it's our goal
-                    move_cost = 3 if top_layer.remove_agents > 1 else 2
+                # Calculate move cost - modified to use adaptive learning
+                # Check if we've learned the cost for this specific move
+                current_pos = (current.x, current.y)
+                move_cost_key = (current_pos[0], current_pos[1], next_pos[0], next_pos[1])
                 
+                # Use learned cost if available, otherwise fallback to cell.move_cost
+                if move_cost_key in self._move_costs:
+                    move_cost = self._move_costs[move_cost_key]
+                    # Apply penalty to cells with previously observed high cost
+                    if move_cost > self._high_cost_threshold:
+                        move_cost *= 1.5  # Penalize high-cost moves to avoid them
+                else:
+                    # Default to cell's move cost
+                    move_cost = cell.move_cost
+                    
                 # Update path if better
                 new_cost = cost_so_far[current] + move_cost
                 if next_loc not in cost_so_far or new_cost < cost_so_far[next_loc]:
                     cost_so_far[next_loc] = new_cost
-                    priority = new_cost + abs(next_loc.x - goal.x) + abs(next_loc.y - goal.y)
+                    # Use Euclidean distance for heuristic
+                    priority = new_cost + math.sqrt((next_loc.x - goal.x)**2 + (next_loc.y - goal.y)**2)
                     heapq.heappush(frontier, (priority, next_loc))
                     came_from[next_loc] = current
         
@@ -750,7 +930,7 @@ class ExampleAgent(Brain):
     def _manage_sectors(self):
         """Manage sector assignments"""
         # Create sectors if needed
-        if not self._sectors and self._world_width > 0 and self._world_height > 0:
+        if not self._sectors and self._world_width and self._world_height:
             self._create_sectors()
         
         # Choose a sector if needed
@@ -783,25 +963,37 @@ class ExampleAgent(Brain):
 
     def _choose_sector(self):
         """Choose a sector to explore"""
+        # Check if corners need to be explored
+        corner_sectors = []
+        for i, sector in enumerate(self._sectors):
+            # Identify sectors containing corners
+            if ((sector['min_x'] == 0 and sector['min_y'] == 0) or
+                (sector['min_x'] == 0 and sector['max_y'] == self._world_height - 1) or
+                (sector['max_x'] == self._world_width - 1 and sector['min_y'] == 0) or
+                (sector['max_x'] == self._world_width - 1 and sector['max_y'] == self._world_height - 1)):
+                corner_sectors.append((i, sector, 0))
+        
+        # Assign to corner first if available
+        if corner_sectors:
+            self._my_sector = corner_sectors[self._agent.get_agent_id().id % len(corner_sectors)][0]
+            return
+
         # Find sectors that aren't fully explored
         available_sectors = []
         for i, sector in enumerate(self._sectors):
             if i not in self._sectors_explored and sector['explored'] < 80:
-                # Factor in agent's ID to encourage different sector choices
+                # Calculate bias based on agent ID
                 my_id = self._agent.get_agent_id().id 
-                # Calculate a bias score based on sector position and agent ID
-                # This creates natural distribution based on agent IDs
                 x_center = (sector['min_x'] + sector['max_x']) / 2
                 y_center = (sector['min_y'] + sector['max_y']) / 2
                 id_bias = abs((x_center * my_id + y_center) % self._world_width)
                 
-                # Add exploration bias to score
+                # Calculate score considering exploration status and ID bias
                 score = sector['explored'] + id_bias * 0.5
                 available_sectors.append((i, sector, score))
         
-        # Choose sector based on combined score of exploration and agent-specific bias
         if available_sectors:
-            available_sectors.sort(key=lambda x: x[2])  # Sort by score
+            available_sectors.sort(key=lambda x: x[2])
             self._my_sector = available_sectors[0][0]
         elif self._sectors:
             # If all sectors explored, pick based on agent ID
@@ -824,7 +1016,7 @@ class ExampleAgent(Brain):
                 if (x, y) not in self._visited and (x, y) not in self._dangerous_cells:
                     unexplored_cells.append((x, y))
         
-        # If no more unexplored cells, mark sector as explored
+        # Mark sector as explored if no unexplored cells
         if not unexplored_cells:
             self._sectors_explored.add(self._my_sector)
             self._my_sector = None
@@ -855,3 +1047,15 @@ class ExampleAgent(Brain):
         
         return (explored_cells / total_cells) * 100 if total_cells > 0 else 0
 
+    def _calculate_path_energy_cost(self, path, world):
+        """Calculate the energy cost to traverse a path"""
+        if not path:
+            return 0
+            
+        total_cost = 0
+        for loc in path:
+            cell = world.get_cell_at(loc)
+            if cell:
+                total_cost += cell.move_cost
+                
+        return total_cost
